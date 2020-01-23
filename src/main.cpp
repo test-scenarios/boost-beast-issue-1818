@@ -2,54 +2,103 @@
 #include "explain.hpp"
 #include "config.hpp"
 
-namespace program {
+#define CATCH_CONFIG_RUNNER
 
-    namespace websocket = beast::websocket;
-    using tcp = net::ip::tcp;
+#include <catch2/catch.hpp>
+#include <boost/filesystem.hpp>
 
-    using namespace std::literals;
+namespace {
+using namespace program;
 
-    int
-    run()
+struct temp_file
+{
+    temp_file(temp_file &&) = default;
+
+    temp_file(temp_file const &) = delete;
+
+    temp_file &
+    operator=(temp_file &&) = default;
+
+    temp_file
+    operator=(temp_file const &) = delete;
+
+    temp_file()
+        : path_(fs::temp_directory_path() / fs::unique_path())
     {
-        auto host = "cpclientapi.softphone.com"s, endpoint = "/counterpath/socketapi/v1"s, port = "9002"s;
-        net::io_context ioc;
-        ssl::context ctx{ssl::context::tls_client};
-        websocket::stream<ssl::stream<tcp::socket>> m_websocket{ioc, ctx};
 
-        tcp::resolver resolver{ioc};
-
-        const auto resolved = resolver.resolve(host, port);
-
-        boost::asio::connect(m_websocket.next_layer().next_layer(), resolved.begin(), resolved.end());
-
-        m_websocket.next_layer().handshake(ssl::stream_base::client);
-        m_websocket.handshake(host, endpoint);
-
-        std::string request = "GET/bringToFront\n"
-                              "User-Agent: TestApp\n"
-                              "Transaction-ID: AE26f998027\n"
-                              "Content-Type: application/xml\n"
-                              "Content-Length: 0";
-        m_websocket.write(boost::asio::buffer(request));
-
-        beast::flat_buffer m_resBuffer;
-        m_websocket.read(m_resBuffer);
-
-        std::cout << beast::buffers_to_string(m_resBuffer.data()) << std::endl;
-
-        m_websocket.close(websocket::close_code::normal);
-
-        return 0;
     }
+
+    ~temp_file()
+    {
+        if (!path_.empty())
+        {
+            system::error_code ec;
+            fs::remove(path_, ec);
+            boost::ignore_unused(ec);
+        }
+    }
+
+    auto path() -> fs::path const&
+    {
+        return path_;
+    }
+
+private:
+
+    fs::path path_;
+};
+
+TEST_CASE("file truncates")
+{
+    auto test_file = temp_file();
+
+    auto header = beast::http::request_header<beast::http::fields>();
+    header.target("/");
+    header.version(11);
+    header.method(beast::http::verb::get);
+    header.set("Server", "test");
+    header.set("Content-Length", "200000");
+
+    auto body = beast::http::file_body::value_type();
+    auto body_reader = beast::http::file_body::reader(header, body);
+    auto error = beast::error_code();
+    body.open(test_file.path().native().c_str(), beast::file_mode::write_new, error);
+    CHECK(!error.value());
+    body_reader.init(200000, error);
+
+    for (int i = 0 ; i < 10000 ; ++i)
+    {
+        body_reader.put(net::buffer("0123456789", 10), error);
+        REQUIRE(!error);
+    }
+
+    ::truncate(test_file.path().native().c_str(), 0);
+
+    for (int i = 0 ; i < 10000 && !error ; ++i)
+    {
+        body_reader.put(net::buffer("0123456789", 10), error);
+        CHECK(!error);
+    }
+
+    body_reader.finish(error);
+    CHECK(!error);
+
+    CHECK(body.size() == 200000);
+    body.close();
+
+    CHECK(fs::file_size(test_file.path()) == 200000);
+}
+
 }
 
 int
-main()
+main(
+    int argc,
+    char **argv)
 {
     try
     {
-        return program::run();
+        return Catch::Session().run(argc, argv);
     }
     catch (...)
     {
